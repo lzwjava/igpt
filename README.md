@@ -47,6 +47,12 @@ Use the GPT-2 BPE tokenizer instead of characters:
 python train.py --tokenizer bpe
 ```
 
+Turn on mixture-of-experts feed-forward blocks (top-2 of 8 experts per block):
+
+```bash
+python train.py --moe
+```
+
 Train on your own text file:
 
 ```bash
@@ -100,6 +106,9 @@ A decoder-only transformer, GPT-2 flavour:
 - `F.scaled_dot_product_attention` with `is_causal=True` (Flash Attention when available)
 - weight tying between the token embedding and the LM head
 - GPT-2 style init, with residual projections scaled by `1/sqrt(2 * n_layer)`
+- optional **mixture-of-experts** feed-forward blocks (`--moe`): a learned router sends
+  each token to the top-k of `--n_experts` experts (Mixtral-style routing) with a
+  Switch-Transformer-style load-balancing auxiliary loss
 
 Defaults are deliberately small (`n_layer=6, n_head=6, n_embd=384, block_size=256`,
 ≈10.7M parameters) so the whole thing trains comfortably on one GPU or even a CPU.
@@ -110,6 +119,8 @@ Defaults are deliberately small (`n_layer=6, n_head=6, n_embd=384, block_size=25
 - gradient accumulation (`--gradient_accumulation_steps`)
 - mixed precision: `bfloat16` on modern GPUs, `float16` + `GradScaler` otherwise
 - gradient clipping, periodic eval, best-val-loss checkpointing
+- with `--moe`, a load-balancing auxiliary loss (coefficient `--moe_aux_loss_coef`)
+  is added to the cross-entropy loss to keep the router from collapsing onto a few experts
 - optional `torch.compile` (`--compile`)
 - optional DDP via `torchrun` (no code changes needed)
 
@@ -122,6 +133,10 @@ Defaults are deliberately small (`n_layer=6, n_head=6, n_embd=384, block_size=25
 | `--data_dir` / `--out_dir`       | `data` / `out`| tokenized data / checkpoints                  |
 | `--block_size`                   | `256`         | context length                                |
 | `--n_layer` / `--n_head` / `--n_embd` | `6` / `6` / `384` | model size                          |
+| `--moe`                          | off           | mixture-of-experts feed-forward blocks         |
+| `--n_experts` / `--n_experts_active` | `8` / `2` | MoE: experts per block / top-k routed per token |
+| `--moe_expert_dim`               | `4`           | MoE: expert hidden dim, as a multiple of `n_embd` |
+| `--moe_aux_loss_coef`            | `0.01`        | MoE: load-balancing auxiliary loss coefficient  |
 | `--dropout`                      | `0.0`         | raise it (e.g. `0.1`) on small datasets        |
 | `--batch_size`                   | `64`          | micro-batch size                              |
 | `--gradient_accumulation_steps`  | `1`           | effective batch = batch_size * this * world   |
@@ -151,6 +166,8 @@ python train.py \
 Tips:
 
 - keep `n_embd % n_head == 0`
+- with `--moe`, total parameters grow with `--n_experts` but only top-k experts run per
+  token; the script prints both total and active parameter counts
 - `block_size` cannot exceed what the data supports; with `char` on shakespeare 256–512 is plenty
 - if you hit OOM, lower `batch_size` first, then `block_size`
 - `--gradient_accumulation_steps` raises the effective batch size without more memory
@@ -163,6 +180,9 @@ Tips:
   loader or HF conversion.
 - `--tokenizer bpe` uses the GPT-2 vocab (50257); it is a fixed-size vocabulary, so the
   model is larger than the char-level one for the same `n_embd`.
+- The MoE dispatch runs each expert as a dense batch (a Python loop over experts), which
+  is simple and correct but slower than a fused all-to-all kernel; fine at this scale,
+  not a sparse-MoE serving system.
 
 ## Acknowledgements
 
