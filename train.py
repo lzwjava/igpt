@@ -224,6 +224,12 @@ class GPTConfig:
     n_embd: int = 384
     dropout: float = 0.0
     bias: bool = True          # use bias in Linear/LayerNorm (GPT-2 style)
+    # mixture-of-experts (replaces the per-block MLP when use_moe=True)
+    use_moe: bool = False
+    n_experts: int = 8         # number of experts per MoE layer
+    n_experts_active: int = 2  # top-k experts routed to per token
+    moe_expert_dim: int = 4    # expert hidden size, as a multiplier of n_embd
+    moe_aux_loss_coef: float = 0.01  # coefficient on the load-balancing aux loss
 
 
 class LayerNorm(nn.Module):
@@ -281,17 +287,85 @@ class MLP(nn.Module):
         return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
 
 
+class Expert(nn.Module):
+    """The feed-forward network of a single expert (same shape as MLP)."""
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        hidden = config.moe_expert_dim * config.n_embd
+        self.c_fc = nn.Linear(config.n_embd, hidden, bias=config.bias)
+        self.c_proj = nn.Linear(hidden, config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU()
+
+    def forward(self, x):
+        return self.c_proj(self.gelu(self.c_fc(x)))
+
+
+class MoE(nn.Module):
+    """Mixture-of-Experts layer: a learned router picks the top-k experts per token.
+
+    Routing follows GShard/Mixtral (softmax over the top-k router logits) and the
+    auxiliary load-balancing loss follows Switch Transformer:
+        L_aux = n_experts * sum_i f_i * P_i
+    where f_i is the fraction of (token, slot) assignments given to expert i and
+    P_i is the mean router probability mass assigned to expert i.
+    """
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        assert 1 <= config.n_experts_active <= config.n_experts
+        self.n_experts = config.n_experts
+        self.top_k = config.n_experts_active
+        self.gate = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        self.experts = nn.ModuleList([Expert(config) for _ in range(config.n_experts)])
+        self.aux_loss = torch.zeros(())
+
+    def forward(self, x):
+        B, T, C = x.shape
+        flat = x.view(-1, C)                                   # (N, C)
+        router_logits = self.gate(flat)                        # (N, n_experts)
+        topk_logits, topk_idx = torch.topk(router_logits, self.top_k, dim=-1)
+        weights = F.softmax(topk_logits, dim=-1)               # (N, k)
+
+        # dispatch: run each expert on the tokens routed to it, weight and combine
+        y = torch.zeros_like(flat)
+        flat_idx = topk_idx.reshape(-1)                        # (N*k,)
+        flat_w = weights.reshape(-1, 1)                        # (N*k, 1)
+        token_idx = torch.arange(flat.size(0), device=x.device).repeat_interleave(self.top_k)
+        for e, expert in enumerate(self.experts):
+            mask = flat_idx == e
+            if not torch.any(mask):
+                continue
+            slot = mask.nonzero(as_tuple=True)[0]
+            out = expert(flat[token_idx[slot]])
+            y = y.index_add(0, token_idx[slot], out * flat_w[slot])
+
+        # load-balancing auxiliary loss (Switch Transformer)
+        router_probs = F.softmax(router_logits, dim=-1)
+        gathered = torch.gather(router_probs, 1, topk_idx)     # (N, k) prob of chosen experts
+        one_hot = F.one_hot(flat_idx, self.n_experts).to(gathered.dtype)  # (N*k, E)
+        density = one_hot.mean(0)                              # f_i: fraction of slots per expert
+        mean_prob = (one_hot * gathered.reshape(-1, 1)).sum(0) / flat.size(0)  # P_i
+        self.aux_loss = self.n_experts * (density * mean_prob).sum()
+
+        return y.view(B, T, C)
+
+
 class Block(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        if config.use_moe:
+            self.moe = MoE(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        ff = self.moe if hasattr(self, "moe") else self.mlp
+        x = x + ff(self.ln_2(x))
         return x
 
 
@@ -319,12 +393,41 @@ class GPT(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
         print(f"model: {self.get_num_params() / 1e6:.2f}M parameters")
+        if config.use_moe:
+            print(
+                f"model: MoE top-{config.n_experts_active}/{config.n_experts}, "
+                f"{self.get_num_params_active() / 1e6:.2f}M active parameters per token"
+            )
 
     def get_num_params(self, non_embedding: bool = True) -> int:
         n = sum(p.numel() for p in self.parameters())
         if non_embedding:
             n -= self.transformer.wpe.weight.numel()
         return n
+
+    def get_num_params_active(self) -> int:
+        """Parameters actually touched per token (top-k of each expert pool is active)."""
+        n = self.get_num_params()
+        if self.config.use_moe:
+            expert_params = sum(
+                p.numel()
+                for block in self.transformer.h
+                if getattr(block, "moe", None) is not None
+                for p in block.moe.experts.parameters()
+            )
+            frac_active = self.config.n_experts_active / self.config.n_experts
+            n -= int(expert_params * (1.0 - frac_active))
+        return n
+
+    def get_aux_loss(self) -> float:
+        """Total (unweighted) load-balancing loss from the most recent forward pass."""
+        if not self.config.use_moe:
+            return 0.0
+        return sum(
+            block.moe.aux_loss.detach().item()
+            for block in self.transformer.h
+            if getattr(block, "moe", None) is not None
+        )
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -339,8 +442,12 @@ class GPT(nn.Module):
         assert T <= self.config.block_size, f"sequence length {T} > block_size {self.config.block_size}"
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         x = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
+        aux_loss = x.new_zeros(())
         for block in self.transformer.h:
             x = block(x)
+            moe = getattr(block, "moe", None)
+            if moe is not None:
+                aux_loss = aux_loss + moe.aux_loss
         x = self.transformer.ln_f(x)
 
         if targets is None:
@@ -349,6 +456,7 @@ class GPT(nn.Module):
 
         logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        loss = loss + self.config.moe_aux_loss_coef * aux_loss
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
@@ -412,6 +520,11 @@ def parse_args():
     p.add_argument("--n_embd", type=int, default=384)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--bias", type=bool, default=True)
+    p.add_argument("--moe", action="store_true", help="use mixture-of-experts feed-forward blocks")
+    p.add_argument("--n_experts", type=int, default=8, help="MoE: number of experts per block")
+    p.add_argument("--n_experts_active", type=int, default=2, help="MoE: top-k experts per token")
+    p.add_argument("--moe_expert_dim", type=int, default=4, help="MoE: expert hidden dim as a multiple of n_embd")
+    p.add_argument("--moe_aux_loss_coef", type=float, default=0.01, help="MoE: load-balancing loss coefficient")
     p.add_argument("--compile", action="store_true", help="torch.compile the model (slow first step, faster after)")
 
     # optimization
@@ -604,6 +717,11 @@ def main():
         n_embd=args.n_embd,
         dropout=args.dropout,
         bias=args.bias,
+        use_moe=args.moe,
+        n_experts=args.n_experts,
+        n_experts_active=args.n_experts_active,
+        moe_expert_dim=args.moe_expert_dim,
+        moe_aux_loss_coef=args.moe_aux_loss_coef,
     )
     if args.init_from == "resume" and os.path.exists(ckpt_path):
         if master_process:
@@ -724,7 +842,7 @@ def main():
             if iter_num >= 5 and device_type == "cuda":
                 mfu = raw_model.get_num_params() * 6 * tokens_per_iter / (dt * 1e12)
                 running_mfu = mfu if running_mfu == 0.0 else 0.9 * running_mfu + 0.1 * mfu
-            print(f"iter {iter_num}: loss {lossf:.4f} | time {dt * 1000:.0f}ms | mfu {running_mfu * 100:.1f}%")
+            print(f"iter {iter_num}: loss {lossf:.4f} | aux {raw_model.get_aux_loss():.4f} | time {dt * 1000:.0f}ms | mfu {running_mfu * 100:.1f}%")
 
         iter_num += 1
 
