@@ -1,5 +1,7 @@
 # igpt
 
+> **Built with help from the `deepseek-v4-flash` model.**
+
 A minimal, **single-file** GPT training script in the spirit of
 [nanoGPT](https://github.com/karpathy/nanoGPT). Everything — data preparation,
 tokenizer, model, training loop, checkpointing and sampling — lives in one file:
@@ -167,8 +169,6 @@ Tips:
 Directly inspired by [nanoGPT](https://github.com/karpathy/nanoGPT) and
 [minGPT](https://github.com/karpathy/minGPT); the model follows the GPT-2
 architecture from *Language Models are Unsupervised Multitask Learners*.
-
-This project was built with help from the **deepseek-v4-flash** model.
 
 ## License
 
