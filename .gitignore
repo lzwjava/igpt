@@ -21,6 +21,8 @@ ENV/
 # Tokenized data and checkpoints produced by train.py
 data/
 out/
+out-wikipedia/
+out-fineweb-124m/
 *.bin
 *.pkl
 *.pt

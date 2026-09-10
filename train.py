@@ -638,6 +638,7 @@ def main():
             print("compiling model ...")
         model = torch.compile(model)
 
+    @torch.no_grad()
     def estimate_loss():
         model.eval()
         out = {}
@@ -730,8 +731,9 @@ def main():
     if ddp:
         torch.distributed.destroy_process_group()
 
-    # final save (always keep the last state around)
+    # final save: keep the last state, but do NOT clobber the best-val checkpoint
     if master_process:
+        last_path = os.path.join(args.out_dir, "ckpt_last.pt")
         torch.save(
             {
                 "model": unwrap(model).state_dict(),
@@ -740,9 +742,9 @@ def main():
                 "iter_num": iter_num,
                 "best_val_loss": best_val_loss,
             },
-            ckpt_path,
+            last_path,
         )
-        print(f"training done; checkpoint at {ckpt_path}")
+        print(f"training done; final state at {last_path} | best-val ckpt at {ckpt_path}")
         sample_and_print(unwrap(model), tokenizer, args, device)
 
 
