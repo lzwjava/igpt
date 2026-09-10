@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tokenized data and checkpoints produced by train.py
+data/
+out/
+*.bin
+*.pkl
+*.pt
+*.pth
+
+# Logs / temp
+*.log
+wandb/
+runs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
